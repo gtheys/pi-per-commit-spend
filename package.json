@@ -28,9 +28,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/geertjam/pi-per-commit-spend"
+    "url": "https://github.com/gtheys/pi-per-commit-spend"
   },
+  "homepage": "https://github.com/gtheys/pi-per-commit-spend#readme",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
