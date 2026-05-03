@@ -28,7 +28,7 @@ $ /spend
 ## Install in one command
 
 ```bash
-pi install npm:pi-per-commit-spend
+pi install npm:@gtheys/pi-per-commit-spend
 ```
 
 Works with any provider — API-reported cost, calculated cost, or a mix.

@@ -34,7 +34,7 @@ The pricing cache is refreshed every 24 hours. Use `/spend-refresh` to force an 
 ## Install
 
 ```bash
-pi install npm:pi-per-commit-spend
+pi install npm:@gtheys/pi-per-commit-spend
 ```
 
 Or install from git:
