@@ -14,6 +14,23 @@ When using subscription services (GitHub Copilot, Claude Max, etc.) the API retu
 
 Calculated costs are tagged with `(calc)` in the `/spend` view.
 
+### How subscription cost calculation works
+
+Subscription providers (like GitHub Copilot) don't expose per-request pricing — the API reports `cost.total = 0` because you pay a flat monthly fee. This extension fills that gap:
+
+1. **On session start**, it fetches [models.dev/api.json](https://models.dev/api.json) — a community-maintained database with pricing for 4,000+ models across 80+ providers
+2. **On `model_select`**, it tracks which model is currently active (e.g. `claude-sonnet-4`, `gpt-5.1`)
+3. **On each assistant message**, if `cost.total = 0`:
+   - It searches models.dev for the model ID across **all providers** (not just the subscription one)
+   - It skips providers that report zero cost (other subscriptions)
+   - It picks the first provider with real per-token pricing
+   - It calculates: `(input × input_price + output × output_price + cache_read × cache_read_price + cache_write × cache_write_price) / 1,000,000`
+4. **Example**: You're using `claude-sonnet-4` via GitHub Copilot. The Copilot provider reports `cost: { input: 0, output: 0 }`. But the same model exists under the `anthropic` provider with `cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }` (per 1M tokens). The extension uses the Anthropic pricing to calculate your cost.
+
+**Note**: The calculated cost is an **estimate** — it reflects what you *would* have paid per-token, not your actual subscription cost. This is useful for comparing productivity across projects and understanding relative spend per commit.
+
+The pricing cache is refreshed every 24 hours. Use `/spend-refresh` to force an update.
+
 ## Install
 
 ```bash

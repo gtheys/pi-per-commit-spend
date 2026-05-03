@@ -4,7 +4,6 @@
   "description": "Pi extension that tracks AI spend per git commit across sessions",
   "main": "extensions/per-commit-spend.js",
   "type": "module",
-  "types": "extensions/per-commit-spend.d.ts",
   "keywords": [
     "pi-package"
   ],
@@ -33,7 +32,7 @@
   "homepage": "https://github.com/gtheys/pi-per-commit-spend#readme",
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/*.js"
     ]
   }
 }
