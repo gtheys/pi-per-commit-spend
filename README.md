@@ -1,43 +1,54 @@
 # pi-per-commit-spend
 
-A [pi](https://github.com/badlogic/pi) extension that tracks AI spend per git commit.
+A [pi](https://github.com/badlogic/pi) extension that tracks AI spend per git commit across sessions.
 
-Each time you commit in the current repo, the extension records the total AI cost accumulated
-since the previous commit (or since the session started). Data persists across sessions in a
-local JSON database.
+Every time you commit in a repo, the extension records the total AI cost accumulated since the previous commit. Spend from multiple sessions is merged — if you work across three sessions before committing, all three sessions' costs roll into that commit's entry.
 
 ## Install
 
-Copy or symlink into your pi extensions directory:
+```bash
+pi install npm:pi-per-commit-spend
+```
+
+Or install from git:
 
 ```bash
-# Global (all projects)
-ln -s $(pwd)/per-commit-spend.ts ~/.pi/agent/extensions/per-commit-spend.ts
-
-# Or project-local
-mkdir -p .pi/extensions
-ln -s $(pwd)/per-commit-spend.ts .pi/extensions/per-commit-spend.ts
+pi install git:github.com/geertjam/pi-per-commit-spend
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/spend` | Show spend breakdown per commit for the current repo |
+| `/spend` | Interactive spend breakdown per commit (Space to expand, Esc/q to close) |
 | `/spend-reset` | Clear all recorded spend data for the current repo |
 
 ## How it works
 
-1. Listens to `message_end` for assistant messages and accumulates `usage.cost.total`
-2. Intercepts `git commit` calls via `tool_call` — after the commit succeeds, records the accumulated spend
-3. On `session_shutdown`, records any uncommitted spend as a "pending" entry
-4. Data is stored in `~/.pi/agent/data/per-commit-spend.json`
+1. **Accumulates** — Every assistant message's `usage.cost.total` is summed in memory
+2. **Records on commit** — When `git commit` succeeds, the accumulated spend is saved to disk
+3. **Persists across sessions** — Uncommitted spend is saved as "pending" on shutdown, then reloaded into the accumulator on the next session so it merges into the next commit
+4. **Survives restarts** — Pending entries from previous sessions automatically roll forward
 
-## Data format
+### Event flow
+
+```
+session_start → load pending entries from DB into accumulator
+       ↓
+message_end → accumulate cost from usage
+       ↓
+tool_result (git commit) → flush accumulator to DB, reset
+       ↓
+session_shutdown → save remaining accumulator as "pending" entry
+```
+
+## Storage
+
+Data lives in `~/.pi/agent/data/per-commit-spend.json`, keyed by repo path:
 
 ```json
 {
-  "/path/to/repo": {
+  "/home/user/my-project": {
     "entries": [
       {
         "commitHash": "abc1234",
@@ -45,6 +56,8 @@ ln -s $(pwd)/per-commit-spend.ts .pi/extensions/per-commit-spend.ts
         "cost": 0.0423,
         "inputTokens": 15000,
         "outputTokens": 3000,
+        "cacheReadTokens": 24000,
+        "cacheWriteTokens": 5000,
         "timestamp": 1709600000000,
         "pending": false
       }
@@ -52,3 +65,15 @@ ln -s $(pwd)/per-commit-spend.ts .pi/extensions/per-commit-spend.ts
   }
 }
 ```
+
+## Development
+
+```bash
+npm install
+npm run build      # compiles src/ → extensions/
+npm pack --dry-run # preview tarball contents
+```
+
+## License
+
+MIT
