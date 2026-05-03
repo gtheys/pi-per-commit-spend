@@ -113,9 +113,9 @@ Entry format:
 
 ## Development
 
+The extension is a single TypeScript file at `index.ts`. Pi loads `.ts` files directly — no build step needed.
+
 ```bash
-npm install
-npm run build      # compiles src/ → extensions/
 npm pack --dry-run # preview tarball contents
 ```
 
