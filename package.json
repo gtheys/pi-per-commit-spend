@@ -1,6 +1,6 @@
 {
   "name": "@gtheys/pi-per-commit-spend",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Pi extension that tracks AI spend per git commit across sessions",
   "type": "module",
   "keywords": [
