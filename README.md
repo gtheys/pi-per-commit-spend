@@ -13,7 +13,7 @@ pi install npm:pi-per-commit-spend
 Or install from git:
 
 ```bash
-pi install git:github.com/geertjam/pi-per-commit-spend
+pi install git:github.com/gtheys/pi-per-commit-spend
 ```
 
 ## Commands
