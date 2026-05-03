@@ -3,7 +3,8 @@
  *
  * Tracks AI cost per git commit, persisting data across sessions.
  * - Accumulates spend from assistant message usage on `message_end`
- * - Flushes to JSON DB when `git commit` is detected via `tool_call`
+ * - Calculates cost from token counts using models.dev pricing when provider returns cost=0
+ * - Flushes to JSON DB when `git commit` is detected via `tool_result`
  * - Records pending spend on `session_shutdown`
  * - `/spend` command to view per-commit breakdown
  */
@@ -11,14 +12,17 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import * as fs from "node:fs";
+import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// AIDEV-NOTE: DB schema — keyed by absolute repo path
+// ── Types ────────────────────────────────────────────────────────────────
+
 interface SpendEntry {
 	commitHash: string;
 	commitMessage: string;
 	cost: number;
+	calculatedCost: boolean; // AIDEV-NOTE: true if derived from tokens, false if from API
 	inputTokens: number;
 	outputTokens: number;
 	cacheReadTokens: number;
@@ -33,10 +37,34 @@ interface RepoSpend {
 
 type SpendDb = Record<string, RepoSpend>;
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+interface ModelCost {
+	input: number; // $ per 1M tokens
+	output: number;
+	cache_read?: number;
+	cache_write?: number;
+}
+
+interface ModelsDevModel {
+	id: string;
+	cost?: ModelCost;
+}
+
+interface ModelsDevProvider {
+	id: string;
+	models: Record<string, ModelsDevModel>;
+}
+
+type ModelsDevDb = Record<string, ModelsDevProvider>;
+
+// ── Constants ────────────────────────────────────────────────────────────
 
 const DB_DIR = path.join(os.homedir(), ".pi", "agent", "data");
 const DB_PATH = path.join(DB_DIR, "per-commit-spend.json");
+const MODELS_CACHE_PATH = path.join(DB_DIR, "per-commit-spend-models.json");
+const MODELS_DEV_URL = "https://models.dev/api.json";
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// ── Persistence ──────────────────────────────────────────────────────────
 
 function loadDb(): SpendDb {
 	try {
@@ -53,23 +81,119 @@ function saveDb(db: SpendDb): void {
 }
 
 function getRepoKey(cwd: string): string {
-	// AIDEV-NOTE: use git rev-parse to resolve the repo root for consistency
-	// Falls back to cwd if not a git repo
 	return cwd;
+}
+
+// ── Models.dev pricing ───────────────────────────────────────────────────
+
+function loadModelsCache(): { db: ModelsDevDb; fetchedAt: number } | null {
+	try {
+		const data = fs.readFileSync(MODELS_CACHE_PATH, "utf8");
+		return JSON.parse(data);
+	} catch {
+		return null;
+	}
+}
+
+function saveModelsCache(db: ModelsDevDb): void {
+	fs.mkdirSync(DB_DIR, { recursive: true });
+	fs.writeFileSync(
+		MODELS_CACHE_PATH,
+		JSON.stringify({ db, fetchedAt: Date.now() }),
+		"utf8",
+	);
+}
+
+async function fetchModelsDev(): Promise<ModelsDevDb> {
+	return new Promise((resolve, reject) => {
+		https
+			.get(MODELS_DEV_URL, (res) => {
+				let data = "";
+				res.on("data", (chunk) => (data += chunk));
+				res.on("end", () => {
+					try {
+						resolve(JSON.parse(data) as ModelsDevDb);
+					} catch (e) {
+						reject(new Error(`Failed to parse models.dev response: ${e}`));
+					}
+				});
+			})
+			.on("error", reject);
+	});
+}
+
+async function ensureModelsCache(): Promise<ModelsDevDb | null> {
+	const cached = loadModelsCache();
+	if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+		return cached.db;
+	}
+
+	try {
+		const db = await fetchModelsDev();
+		saveModelsCache(db);
+		return db;
+	} catch (e) {
+		// AIDEV-NOTE: return stale cache if fetch fails, else null
+		if (cached) return cached.db;
+		console.error("[per-commit-spend] Failed to fetch models.dev:", e);
+		return null;
+	}
+}
+
+/**
+ * Look up pricing for a model ID across all providers in models.dev.
+ * Skips providers where cost is { input: 0, output: 0 } (subscription providers).
+ * Returns the first provider with real pricing.
+ */
+function findPricing(modelsDb: ModelsDevDb, modelId: string): ModelCost | null {
+	for (const provider of Object.values(modelsDb)) {
+		const model = provider.models[modelId];
+		if (!model?.cost) continue;
+		// AIDEV-NOTE: skip subscription providers that report zero cost
+		if (model.cost.input === 0 && model.cost.output === 0) continue;
+		return model.cost;
+	}
+	return null;
+}
+
+/**
+ * Calculate cost from token counts using pricing data.
+ * All prices are per 1M tokens.
+ */
+function calculateCost(
+	pricing: ModelCost,
+	input: number,
+	output: number,
+	cacheRead: number,
+	cacheWrite: number,
+): number {
+	const cost =
+		(input * pricing.input) / 1_000_000 +
+		(output * pricing.output) / 1_000_000 +
+		(cacheRead * (pricing.cache_read ?? pricing.input)) / 1_000_000 +
+		(cacheWrite * (pricing.cache_write ?? pricing.input)) / 1_000_000;
+	return cost;
 }
 
 // ── Extension ────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// Accumulated spend since last commit (in-memory, per session)
 	let accumulatedCost = 0;
 	let accumulatedInput = 0;
 	let accumulatedOutput = 0;
 	let accumulatedCacheRead = 0;
 	let accumulatedCacheWrite = 0;
+	let accumulatedCalculated = false; // track if any cost was calculated (not from API)
 
-	// Resolved repo key — set on session_start
 	let repoKey: string | undefined;
+	let modelsDb: ModelsDevDb | null = null;
+	let currentModelId: string | undefined;
+
+	// ── Resolve model ID ──
+
+	pi.on("model_select", async (event, _ctx) => {
+		currentModelId = event.model.id;
+	});
 
 	// ── Accumulate spend from each assistant message ──
 
@@ -79,14 +203,33 @@ export default function (pi: ExtensionAPI) {
 		const usage = event.message.usage;
 		if (!usage) return;
 
-		accumulatedCost += usage.cost?.total ?? 0;
-		accumulatedInput += usage.input ?? 0;
-		accumulatedOutput += usage.output ?? 0;
-		accumulatedCacheRead += usage.cacheRead ?? 0;
-		accumulatedCacheWrite += usage.cacheWrite ?? 0;
+		const apiCost = usage.cost?.total ?? 0;
+		const input = usage.input ?? 0;
+		const output = usage.output ?? 0;
+		const cacheRead = usage.cacheRead ?? 0;
+		const cacheWrite = usage.cacheWrite ?? 0;
+
+		let cost = apiCost;
+		let calculated = false;
+
+		// AIDEV-NOTE: If API reports no cost (subscription), calculate from tokens
+		if (cost === 0 && (input > 0 || output > 0) && modelsDb && currentModelId) {
+			const pricing = findPricing(modelsDb, currentModelId);
+			if (pricing) {
+				cost = calculateCost(pricing, input, output, cacheRead, cacheWrite);
+				calculated = true;
+			}
+		}
+
+		accumulatedCost += cost;
+		accumulatedInput += input;
+		accumulatedOutput += output;
+		accumulatedCacheRead += cacheRead;
+		accumulatedCacheWrite += cacheWrite;
+		if (calculated) accumulatedCalculated = true;
 	});
 
-	// ── Detect git commit via tool_call ──
+	// ── Detect git commit via tool_result ──
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== "bash") return;
@@ -95,8 +238,6 @@ export default function (pi: ExtensionAPI) {
 		const command = input?.command ?? "";
 		if (!command) return;
 
-		// AIDEV-NOTE: match `git commit` but not `git commit --amend` or dry-run
-		// We check the tool result to see if the commit succeeded
 		const isCommit =
 			/\bgit\s+commit\b/.test(command) &&
 			!/\b--amend\b/.test(command) &&
@@ -104,10 +245,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (!isCommit) return;
 
-		// Check if there's any spend to record
 		if (accumulatedCost === 0 && accumulatedInput === 0) return;
 
-		// Get commit info
 		const { stdout: hash } = await pi.exec("git", ["rev-parse", "--short", "HEAD"], {
 			cwd: ctx.cwd,
 		});
@@ -119,6 +258,7 @@ export default function (pi: ExtensionAPI) {
 			commitHash: hash.trim(),
 			commitMessage: message.trim(),
 			cost: accumulatedCost,
+			calculatedCost: accumulatedCalculated,
 			inputTokens: accumulatedInput,
 			outputTokens: accumulatedOutput,
 			cacheReadTokens: accumulatedCacheRead,
@@ -131,22 +271,23 @@ export default function (pi: ExtensionAPI) {
 		const db = loadDb();
 		if (!db[key]) db[key] = { entries: [] };
 
-		// AIDEV-NOTE: remove prior pending entries — their spend is now rolled
-		// into this commit's accumulator (loaded on session_start)
 		db[key].entries = db[key].entries.filter((e) => !e.pending);
-
 		db[key].entries.push(entry);
 		saveDb(db);
 
-		// Reset accumulator
 		accumulatedCost = 0;
 		accumulatedInput = 0;
 		accumulatedOutput = 0;
 		accumulatedCacheRead = 0;
 		accumulatedCacheWrite = 0;
+		accumulatedCalculated = false;
 
 		if (ctx.hasUI) {
-			ctx.ui.notify(`Spend recorded for ${entry.commitHash}: $${entry.cost.toFixed(4)}`, "info");
+			const calcTag = entry.calculatedCost ? " (calculated)" : "";
+			ctx.ui.notify(
+				`Spend recorded for ${entry.commitHash}: $${entry.cost.toFixed(4)}${calcTag}`,
+				"info",
+			);
 		}
 	});
 
@@ -160,6 +301,7 @@ export default function (pi: ExtensionAPI) {
 			commitHash: "pending",
 			commitMessage: "(uncommitted work)",
 			cost: accumulatedCost,
+			calculatedCost: accumulatedCalculated,
 			inputTokens: accumulatedInput,
 			outputTokens: accumulatedOutput,
 			cacheReadTokens: accumulatedCacheRead,
@@ -174,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 		saveDb(db);
 	});
 
-	// ── Resolve repo key on session start ──
+	// ── Resolve repo key + load models cache on session start ──
 
 	pi.on("session_start", async (_event, ctx) => {
 		const { stdout, code } = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
@@ -186,8 +328,7 @@ export default function (pi: ExtensionAPI) {
 			repoKey = ctx.cwd;
 		}
 
-		// AIDEV-NOTE: load pending entries and add to accumulator so they merge
-		// into the next commit. This handles multi-session pre-commit spend.
+		// Load pending entries into accumulator
 		const db = loadDb();
 		const repoData = db[repoKey];
 		if (repoData) {
@@ -198,9 +339,24 @@ export default function (pi: ExtensionAPI) {
 					accumulatedOutput += entry.outputTokens;
 					accumulatedCacheRead += entry.cacheReadTokens;
 					accumulatedCacheWrite += entry.cacheWriteTokens;
+					if (entry.calculatedCost) accumulatedCalculated = true;
 				}
 			}
 		}
+
+		// AIDEV-NOTE: fetch models.dev pricing in background — non-blocking
+		ensureModelsCache().then((db) => {
+			modelsDb = db;
+			if (db) {
+				const modelCount = Object.values(db).reduce(
+					(sum, p) => sum + Object.keys(p.models).length,
+					0,
+				);
+				console.error(
+					`[per-commit-spend] Loaded pricing for ${modelCount} models from models.dev`,
+				);
+			}
+		});
 	});
 
 	// ── /spend command ──
@@ -218,7 +374,6 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!ctx.hasUI) {
-				// Print mode fallback
 				const totalCost = repoData.entries.reduce((sum, e) => sum + e.cost, 0);
 				ctx.ui.notify(
 					`Total spend: $${totalCost.toFixed(4)} across ${repoData.entries.length} entries`,
@@ -275,10 +430,13 @@ export default function (pi: ExtensionAPI) {
 								: theme.fg("accent", entry.commitHash);
 							const cost = theme.fg("success", `$${entry.cost.toFixed(4)}`);
 							const pending = entry.pending ? theme.fg("warning", " ⚠") : "";
+							const calcTag = entry.calculatedCost
+								? theme.fg("dim", " (calc)")
+								: "";
 
 							if (expanded) {
 								lines.push(
-									tw(`  ${hash} ${cost}${pending} ${theme.fg("dim", `↑${formatTokens(entry.inputTokens)} ↓${formatTokens(entry.outputTokens)}`)}`),
+									tw(`  ${hash} ${cost}${calcTag}${pending} ${theme.fg("dim", `↑${formatTokens(entry.inputTokens)} ↓${formatTokens(entry.outputTokens)}`)}`),
 								);
 								lines.push(
 									tw(`  ${theme.fg("dim", `  ${entry.commitMessage}`)}`),
@@ -294,7 +452,7 @@ export default function (pi: ExtensionAPI) {
 										? entry.commitMessage.slice(0, 37) + "..."
 										: entry.commitMessage;
 								lines.push(
-									tw(`  ${hash} ${cost}${pending} ${theme.fg("muted", msg)}`),
+									tw(`  ${hash} ${cost}${calcTag}${pending} ${theme.fg("muted", msg)}`),
 								);
 							}
 						}
@@ -308,12 +466,27 @@ export default function (pi: ExtensionAPI) {
 						);
 						lines.push("");
 
-						// Current session accumulator
 						if (accumulatedCost > 0) {
+							const calcTag = accumulatedCalculated ? " (calc)" : "";
 							lines.push(
-								tw(`  ${theme.fg("warning", `Current session (uncommitted): $${accumulatedCost.toFixed(4)}`)}`),
+								tw(`  ${theme.fg("warning", `Current session (uncommitted): $${accumulatedCost.toFixed(4)}${calcTag}`)}`),
 							);
 							lines.push("");
+						}
+
+						// Pricing source status
+						if (modelsDb) {
+							const modelCount = Object.values(modelsDb).reduce(
+								(sum, p) => sum + Object.keys(p.models).length,
+								0,
+							);
+							lines.push(
+								tw(theme.fg("dim", `  Pricing: models.dev (${modelCount} models)`)),
+							);
+						} else {
+							lines.push(
+								tw(theme.fg("warning", "  Pricing: models.dev unavailable")),
+							);
 						}
 
 						lines.push(
@@ -348,14 +521,35 @@ export default function (pi: ExtensionAPI) {
 			delete db[key];
 			saveDb(db);
 
-			// Reset accumulator too
 			accumulatedCost = 0;
 			accumulatedInput = 0;
 			accumulatedOutput = 0;
 			accumulatedCacheRead = 0;
 			accumulatedCacheWrite = 0;
+			accumulatedCalculated = false;
 
 			ctx.ui.notify("Spend data cleared.", "info");
+		},
+	});
+
+	// ── /spend-refresh command ──
+
+	pi.registerCommand("spend-refresh", {
+		description: "Force-refresh models.dev pricing cache",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("Fetching models.dev pricing...", "info");
+			try {
+				const db = await fetchModelsDev();
+				saveModelsCache(db);
+				modelsDb = db;
+				const modelCount = Object.values(db).reduce(
+					(sum, p) => sum + Object.keys(p.models).length,
+					0,
+				);
+				ctx.ui.notify(`Pricing updated: ${modelCount} models loaded.`, "info");
+			} catch (e) {
+				ctx.ui.notify(`Failed to fetch pricing: ${e}`, "error");
+			}
 		},
 	});
 }

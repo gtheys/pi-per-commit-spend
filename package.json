@@ -1,6 +1,6 @@
 {
   "name": "pi-per-commit-spend",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Pi extension that tracks AI spend per git commit across sessions",
   "main": "extensions/per-commit-spend.js",
   "type": "module",
