@@ -1,0 +1,36 @@
+{
+  "name": "pi-per-commit-spend",
+  "version": "0.1.0",
+  "description": "Pi extension that tracks AI spend per git commit across sessions",
+  "main": "extensions/per-commit-spend.js",
+  "type": "module",
+  "types": "extensions/per-commit-spend.d.ts",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/geertjam/pi-per-commit-spend"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
