@@ -203,6 +203,11 @@ export default function (pi: ExtensionAPI) {
 		const usage = event.message.usage;
 		if (!usage) return;
 
+		// AIDEV-NOTE: Extract model from message as fallback if model_select never fired
+		if (event.message.model) {
+			currentModelId = event.message.model;
+		}
+
 		const apiCost = usage.cost?.total ?? 0;
 		const input = usage.input ?? 0;
 		const output = usage.output ?? 0;
