@@ -146,8 +146,11 @@ async function ensureModelsCache(): Promise<ModelsDevDb | null> {
  * Returns the first provider with real pricing.
  */
 function findPricing(modelsDb: ModelsDevDb, modelId: string): ModelCost | null {
+	// AIDEV-NOTE: normalize dots to dashes — Copilot reports e.g. "claude-sonnet-4.6"
+	// but models.dev keys use dashes e.g. "claude-sonnet-4-6"
+	const normalized = modelId.replace(/\./g, "-");
 	for (const provider of Object.values(modelsDb)) {
-		const model = provider.models[modelId];
+		const model = provider.models[modelId] ?? provider.models[normalized];
 		if (!model?.cost) continue;
 		// AIDEV-NOTE: skip subscription providers that report zero cost
 		if (model.cost.input === 0 && model.cost.output === 0) continue;
